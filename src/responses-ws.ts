@@ -10,6 +10,11 @@ import { connectionNamedHeaders, UPSTREAM_HOP_HEADERS } from "./server/headers.j
 import { normalizeSseLineEndings } from "./sse-util.js";
 
 type JsonObject = Record<string, unknown>;
+type DiagnosticLog = (level: "debug" | "warn", message: string) => void;
+
+function closeCode(event: Event): number | "none" {
+    return "code" in event && typeof event.code === "number" ? event.code : "none";
+}
 
 function object(value: unknown): value is JsonObject {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -112,14 +117,22 @@ export class ResponsesWsUpstream {
     private socket?: InstanceType<typeof UpstreamWebSocket>;
     private key?: string;
     private history = new ResponsesWsHistory();
-    private active?: { fail: (error: Error) => void };
+    private active?: { fail: (error: Error, reason?: string) => void };
 
-    close(): void {
+    constructor(private readonly log: DiagnosticLog = () => {}) {}
+
+    private resetHistory(reason: string): void {
+        this.history.clear();
+        this.log("debug", `upstream checkpoint reset reason=${reason}`);
+    }
+
+    close(reason = "transport-close"): void {
         const socket = this.socket;
         this.socket = undefined;
         this.key = undefined;
-        this.history.clear();
-        this.active?.fail(new Error("Responses WebSocket closed"));
+        if (this.active) this.active.fail(new Error("Responses WebSocket closed"), reason);
+        else if (socket) this.resetHistory(reason);
+        else this.history.clear();
         if (socket && socket.readyState < UpstreamWebSocket.CLOSING) socket.close();
     }
 
@@ -129,7 +142,8 @@ export class ResponsesWsUpstream {
         const wsUrl = url.replace(/^http/, "ws");
         const key = `${wsUrl}:${canonical(headers)}`;
         if (this.key === key && this.socket?.readyState === UpstreamWebSocket.OPEN) return this.socket;
-        this.close();
+        this.close(this.key !== key ? "connection-key-changed" : "reconnect");
+        this.log("debug", "upstream connecting phase=handshake");
         const socket = new UpstreamWebSocket(wsUrl, { headers, dispatcher: options.dispatcher as Dispatcher | undefined });
         this.socket = socket;
         this.key = key;
@@ -140,9 +154,13 @@ export class ResponsesWsUpstream {
                 socket.removeEventListener("close", failed);
                 options.signal?.removeEventListener("abort", aborted);
             };
-            const opened = (): void => { clean(); resolve(); };
-            const failed = (): void => { clean(); reject(new Error("Responses WebSocket handshake failed")); };
-            const aborted = (): void => { clean(); this.close(); reject(new DOMException("Aborted", "AbortError")); };
+            const opened = (): void => { clean(); this.log("debug", "upstream connected phase=handshake"); resolve(); };
+            const failed = (event: Event): void => {
+                clean();
+                this.log("warn", `upstream failed phase=handshake event=${event.type} close_code=${closeCode(event)}`);
+                reject(new Error("Responses WebSocket handshake failed"));
+            };
+            const aborted = (): void => { clean(); this.log("debug", "upstream aborted phase=handshake"); this.close("handshake-abort"); reject(new DOMException("Aborted", "AbortError")); };
             socket.addEventListener("open", opened, { once: true });
             socket.addEventListener("error", failed, { once: true });
             socket.addEventListener("close", failed, { once: true });
@@ -160,12 +178,14 @@ export class ResponsesWsUpstream {
         const socket = await this.connect(url, options);
         if (this.active) throw new Error("Responses WebSocket exchange already active");
         const request = this.history.continuation(body);
+        this.log("debug", `upstream request mode=${request.previous_response_id === undefined ? "full" : "delta"}`);
         return new Promise<Response>((resolve, reject) => {
             const output = new ResponsesWsOutput();
             let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
             let settled = false;
             let ended = false;
             let retryFull = request.previous_response_id !== undefined;
+            let receivedEvents = 0;
             const encoder = new TextEncoder();
             const clean = (): void => {
                 ended = true;
@@ -175,56 +195,68 @@ export class ResponsesWsUpstream {
                 options.signal?.removeEventListener("abort", aborted);
                 this.active = undefined;
             };
-            const fail = (error: Error): void => {
+            const fail = (error: Error, reason = "transport-close"): void => {
                 if (ended) return;
-                this.history.clear();
+                this.resetHistory(reason);
                 clean();
                 if (settled) controller?.error(error);
                 else reject(error);
             };
-            const failed = (): void => fail(new Error("Responses WebSocket upstream disconnected before completion"));
-            const aborted = (): void => { fail(new DOMException("Aborted", "AbortError")); this.close(); };
+            const failed = (event: Event): void => {
+                this.log("warn", `upstream failed phase=${receivedEvents > 0 ? "stream" : "await-first-event"} event=${event.type} close_code=${closeCode(event)} received_events=${receivedEvents}`);
+                fail(new Error("Responses WebSocket upstream disconnected before completion"), "upstream-disconnect");
+            };
+            const aborted = (): void => {
+                this.log("debug", `upstream aborted phase=${receivedEvents > 0 ? "stream" : "await-first-event"}`);
+                fail(new DOMException("Aborted", "AbortError"), "request-abort");
+                this.close("request-abort");
+            };
             const message = (event: { data: unknown }): void => {
                 if (ended) return;
                 try {
                     if (typeof event.data !== "string" || Buffer.byteLength(event.data) > MAX_REQUEST_BYTES) throw new Error("Invalid or oversized Responses WebSocket frame");
                     const frame: unknown = JSON.parse(event.data);
                     if (!object(frame) || typeof frame.type !== "string") throw new Error("Invalid Responses WebSocket event");
+                    receivedEvents++;
                     const completed = output.observe(frame);
                     if (frame.type === "error" && !settled) {
                         const error = object(frame.error) ? frame.error : {};
                         if (rotateRetry && error.code === "websocket_connection_limit_reached") {
+                            this.log("debug", "upstream retry reason=connection-limit action=reconnect-full");
                             clean();
-                            this.close();
+                            this.close("connection-limit");
                             resolve(this.fetch(url, options, false));
                             return;
                         }
                         if (retryFull && (error.code === "previous_response_not_found" || frame.status === 400 && (error.code === undefined || error.code === "invalid_request_error"))) {
                             retryFull = false;
-                            this.history.clear();
+                            this.resetHistory("continuation-rejected");
+                            this.log("debug", "upstream retry reason=continuation-rejected action=resend-full");
                             socket.send(JSON.stringify({ ...body, type: "response.create" }));
                             return;
                         }
                         clean();
-                        this.history.clear();
+                        this.resetHistory("upstream-error");
                         const status = typeof frame.status === "number" && frame.status >= 400 && frame.status <= 599 ? frame.status : 400;
+                        this.log("warn", `upstream rejected phase=await-first-event status=${status}`);
                         resolve(new Response(JSON.stringify(frame), { status, headers: { "content-type": "application/json" } }));
                         return;
                     }
                     if (stream !== true) {
                         if (frame.type === "response.completed" || frame.type === "response.failed" || frame.type === "response.incomplete") {
                             clean();
-                            this.history.clear();
+                            if (completed) this.history.clear();
+                            else this.resetHistory(frame.type);
                             this.history.commit(body, completed);
                             resolve(new Response(JSON.stringify(completed ?? frame.response), { headers: { "content-type": "application/json" } }));
-                        } else if (frame.type === "error") fail(new Error("Responses WebSocket upstream error"));
+                        } else if (frame.type === "error") fail(new Error("Responses WebSocket upstream error"), "upstream-error");
                         return;
                     }
                     if (!settled) {
                         settled = true;
                         const readable = new ReadableStream<Uint8Array>({
                             start: c => { controller = c; },
-                            cancel: () => { fail(new DOMException("Aborted", "AbortError")); this.close(); },
+                            cancel: () => { fail(new DOMException("Aborted", "AbortError"), "response-cancel"); this.close("response-cancel"); },
                         }, { highWaterMark: MAX_REQUEST_BYTES, size: chunk => chunk.byteLength });
                         resolve(new Response(readable, { headers: { "content-type": "text/event-stream" } }));
                     }
@@ -232,13 +264,14 @@ export class ResponsesWsUpstream {
                     controller?.enqueue(encoder.encode(`event: ${frame.type}\ndata: ${event.data}\n\n`));
                     if (frame.type === "response.completed" || frame.type === "response.failed" || frame.type === "response.incomplete" || frame.type === "error") {
                         clean();
-                        this.history.clear();
+                        if (completed) this.history.clear();
+                        else this.resetHistory(String(frame.type));
                         this.history.commit(body, completed);
                         controller?.close();
                     }
                 } catch (error) {
-                    fail(error instanceof Error ? error : new Error("Invalid Responses WebSocket event"));
-                    this.close();
+                    fail(error instanceof Error ? error : new Error("Invalid Responses WebSocket event"), "invalid-event");
+                    this.close("invalid-event");
                 }
             };
             this.active = { fail };
@@ -249,7 +282,7 @@ export class ResponsesWsUpstream {
             if (options.signal?.aborted) aborted();
             else {
                 try { socket.send(JSON.stringify({ ...request, type: "response.create" })); }
-                catch (error) { fail(error instanceof Error ? error : new Error("Responses WebSocket send failed")); }
+                catch (error) { fail(error instanceof Error ? error : new Error("Responses WebSocket send failed"), "send-failed"); }
             }
         });
     }
@@ -339,14 +372,15 @@ export function installResponsesWebSocket(
 ): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
     const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
     const transports = new Set<ResponsesWsUpstream>();
+    let connectionId = 0;
     const close = server.close.bind(server);
     server.close = callback => {
-        for (const transport of transports) transport.close();
+        for (const transport of transports) transport.close("server-close");
         for (const peer of wss.clients) peer.terminate();
         return close(callback);
     };
     server.on("close", () => {
-        for (const transport of transports) transport.close();
+        for (const transport of transports) transport.close("server-close");
         for (const peer of wss.clients) peer.terminate();
         wss.close();
     });
@@ -363,21 +397,25 @@ export function installResponsesWebSocket(
             }
             if (socket.destroyed) return;
             wss.handleUpgrade(source, socket, head, peer => {
-                const transport = new ResponsesWsUpstream();
+                const label = `[responses-ws] [conn=${++connectionId}] [session=${JSON.stringify(conversation.slice(0, 128))}]`;
+                const trace: DiagnosticLog = (level, message) => log(level, `${label} ${message}`);
+                const transport = new ResponsesWsUpstream(trace);
                 transports.add(transport);
                 const history = new ResponsesWsHistory();
                 let active: ResponsesWsResponse | undefined;
                 let busy = false;
                 peer.on("error", () => {});
-                peer.on("close", () => {
+                peer.on("close", code => {
+                    trace("debug", `client closed phase=${busy ? "active" : "idle"} close_code=${code}`);
                     active?.destroy();
-                    transport.close();
+                    transport.close("client-close");
                     history.clear();
+                    trace("debug", "client checkpoint reset reason=client-close");
                     transports.delete(transport);
                 });
                 peer.on("message", (data, binary) => {
                     if (binary) { peer.close(1003, "Responses requires text frames"); return; }
-                    if (busy) { peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
+                    if (busy) { trace("warn", "client rejected reason=response-in-progress"); peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
                     let frame: unknown;
                     let body: JsonObject;
                     try {
@@ -388,6 +426,7 @@ export function installResponsesWebSocket(
                         if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) throw new Error("request_too_large");
                     } catch (error) {
                         const code = error instanceof Error && ["previous_response_not_found", "request_too_large"].includes(error.message) ? error.message : "invalid_request";
+                        trace("warn", `client rejected reason=${code}`);
                         peer.send(errorFrame(code, code === "previous_response_not_found" ? "Send full input without previous_response_id" : "Invalid or oversized response.create event", code === "request_too_large" ? 413 : 400));
                         return;
                     }
@@ -411,10 +450,10 @@ export function installResponsesWebSocket(
                             await dispatch(req, res);
                             if (res.response) {
                                 history.commit(body, res.response);
-                                if (res.restoredOutputItems > 0) log("debug", `[responses-ws] [${conversation}] checkpoint restored ${res.restoredOutputItems} streamed output item(s) absent from terminal output`);
+                                if (res.restoredOutputItems > 0) trace("debug", `checkpoint restored ${res.restoredOutputItems} streamed output item(s) absent from terminal output`);
                             }
                         } catch {
-                            log("warn", "[responses-ws] exchange failed");
+                            trace("warn", `exchange failed phase=dispatch terminal=${res.terminal}`);
                             if (!res.writableEnded) res.end();
                         } finally {
                             active = undefined;
@@ -422,7 +461,7 @@ export function installResponsesWebSocket(
                         }
                     });
                 });
-                log("info", "[responses-ws] OpenCode Responses socket connected (ACP request pipeline)");
+                log("info", `${label} OpenCode Responses socket connected (ACP request pipeline)`);
             });
         })().catch(() => {
             log("warn", "[responses-ws] upgrade failed");

@@ -5,7 +5,7 @@ import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { once } from "node:events";
+import { on, once } from "node:events";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import WebSocket, { WebSocketServer } from "ws";
@@ -77,11 +77,15 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
     let serial = 0;
     let toolArguments: string | undefined;
     let toolName = "write";
-    let nextError: Item | undefined;
+    const nextErrors: Item[] = [];
     let stalled = false;
     let disconnect = false;
+    let terminalMode: "completed" | "failed" | "incomplete" | "hold" | "disconnect" = "completed";
+    let finishHeld: (() => void) | undefined;
+    let connections = 0;
     const upstream = http.createServer((req, res) => { if (req.method === "POST") httpRequests++; res.writeHead(404).end(); });
     const wss = new WebSocketServer({ server: upstream });
+    wss.on("connection", () => { connections++; });
     wss.on("connection", (peer, req) => peer.on("message", raw => {
         const request = JSON.parse(raw.toString()) as Item;
         const violations = validateResponsesWsCreate(request);
@@ -90,7 +94,8 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
         const previous = typeof request.previous_response_id === "string" ? snapshots.get(request.previous_response_id) : undefined;
         const full = previous ? [...previous, ...delta] : delta;
         rows.push({ request, full, headers: req.headers });
-        if (nextError) { peer.send(JSON.stringify(nextError)); nextError = undefined; return; }
+        const nextError = nextErrors.shift();
+        if (nextError) { peer.send(JSON.stringify(nextError)); return; }
         if (disconnect) { disconnect = false; peer.terminate(); return; }
         if (stalled) return;
         if (request.previous_response_id && !previous) { peer.send(JSON.stringify({ type: "error", status: 400, error: { code: "previous_response_not_found", message: "missing upstream checkpoint" } })); return; }
@@ -116,8 +121,14 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
             send("response.output_text.done", { item_id: item.id, output_index: outputIndex, content_index: 0, text: `ok-${serial}` });
         }
         send("response.output_item.done", { output_index: outputIndex, item });
-        snapshots.set(id, [...full, ...output]);
-        send("response.completed", { response: { id, object: "response", status: "completed", ...(terminalOutput === "omitted" ? {} : { output: terminalOutput === "full" ? output : terminalOutput === "suffix" ? [item] : prefix }), usage: { input_tokens: 500, output_tokens: 10, total_tokens: 510 } } });
+        const finish = () => {
+            const status = terminalMode === "failed" || terminalMode === "incomplete" ? terminalMode : "completed";
+            if (status === "completed") snapshots.set(id, [...full, ...output]);
+            send(`response.${status}`, { response: { id, object: "response", status, ...(terminalOutput === "omitted" ? {} : { output: terminalOutput === "full" ? output : terminalOutput === "suffix" ? [item] : prefix }), usage: { input_tokens: 500, output_tokens: 10, total_tokens: 510 } } });
+        };
+        if (terminalMode === "hold") finishHeld = finish;
+        else if (terminalMode === "disconnect") peer.close(1011, "private-upstream-close-reason");
+        else finish();
     }));
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
@@ -129,12 +140,16 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
     const proxyOrigin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const upstreamOrigin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
     const sid = `ses_ws_${randomUUID()}`;
-    const peer = new WebSocket(`${proxyOrigin.replace(/^http/, "ws")}/bili/responses/${upstreamOrigin}/v1/responses`, { headers: { authorization: "Bearer fake-credential", "x-bili-plugin": "opencode", "x-bili-plugin-conversation": sid, "x-bili-plugin-model": "gpt-5.2", "x-bili-plugin-context-window": "200000" } });
-    await once(peer, "open");
-    async function turn(input: Item[], previous?: string, extra: Item = {}): Promise<Item[]> {
+    const openPeer = async (authorization = "Bearer fake-credential") => {
+        const client = new WebSocket(`${proxyOrigin.replace(/^http/, "ws")}/bili/responses/${upstreamOrigin}/v1/responses`, { headers: { authorization, "x-bili-plugin": "opencode", "x-bili-plugin-conversation": sid, "x-bili-plugin-model": "gpt-5.2", "x-bili-plugin-context-window": "200000" } });
+        await once(client, "open");
+        return client;
+    };
+    const peer = await openPeer();
+    async function turn(input: Item[], previous?: string, extra: Item = {}, client = peer): Promise<Item[]> {
         return new Promise((resolve, reject) => {
             const events: Item[] = [];
-            const cleanup = (): void => { clearTimeout(timer); peer.off("message", onMessage); peer.off("close", onClose); };
+            const cleanup = (): void => { clearTimeout(timer); client.off("message", onMessage); client.off("close", onClose); };
             const timer = setTimeout(() => { cleanup(); reject(new Error("WS turn timed out")); }, 10000);
             const onClose = (): void => { cleanup(); reject(new Error("WS client closed")); };
             const onMessage = (raw: WebSocket.RawData): void => {
@@ -145,13 +160,22 @@ async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" 
                     resolve(events);
                 }
             };
-            peer.on("message", onMessage);
-            peer.once("close", onClose);
-            peer.send(JSON.stringify({ type: "response.create", model: "gpt-5.2", store: false, input, tools: BILI_ACP_TOOLS_RESPONSES, ...(previous ? { previous_response_id: previous } : {}), ...extra }));
+            client.on("message", onMessage);
+            client.once("close", onClose);
+            client.send(JSON.stringify({ type: "response.create", model: "gpt-5.2", store: false, input, tools: BILI_ACP_TOOLS_RESPONSES, ...(previous ? { previous_response_id: previous } : {}), ...extra }));
         });
     }
-    return { rows, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn,
-        setError: (error: Item) => { nextError = error; },
+    return { rows, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn, openPeer,
+        logPath: path.join(tmp, "bili.log"),
+        connectionCount: () => connections,
+        setTerminalMode: (value: typeof terminalMode) => { terminalMode = value; },
+        finishHeld: () => { assert.ok(finishHeld); const finish = finishHeld; finishHeld = undefined; finish(); },
+        closeUpstream: async () => {
+            const closed = [...wss.clients].map(client => once(client, "close"));
+            for (const client of wss.clients) client.close(1000, "private-idle-close-reason");
+            await Promise.all(closed);
+        },
+        setError: (error: Item) => { nextErrors.push(error); },
         setStalled: (value: boolean) => { stalled = value; },
         disconnectNext: () => { disconnect = true; },
         setTerminalOutput: (value: typeof terminalOutput) => { terminalOutput = value; },
@@ -170,6 +194,14 @@ const completed = (events: Item[]): Item => {
     assert.ok(event, JSON.stringify(events));
     return event.response as Item;
 };
+
+async function nextEvent(peer: WebSocket, type: string): Promise<Item> {
+    for await (const [raw] of on(peer, "message", { signal: AbortSignal.timeout(10000) })) {
+        const event = JSON.parse(String(raw)) as Item;
+        if (event.type === type) return event;
+    }
+    throw new Error(`Missing WS event: ${type}`);
+}
 
 test("Responses WS: both ends use sockets; incremental tool continuation reaches ACP and usage", { timeout: 30000 }, async () => {
     const f = await fixture();
@@ -432,6 +464,158 @@ test("Responses WS: unknown continuation returns an explicit retry-full error", 
     } finally { await f.close(); }
 });
 
+for (const terminalMode of ["disconnect", "failed", "incomplete"] as const) {
+test(`Responses WS faults: ${terminalMode} after a delivered tool never commits or silently replays it`, { timeout: 30000 }, async () => {
+    const f = await fixture("empty");
+    try {
+        const seed = completed(await f.turn([user("retained before interrupted tool")]));
+        f.setToolArguments('{"text":"private-tool-payload"}');
+        f.setTerminalMode(terminalMode);
+        const events = await f.turn([user("private-request-payload")], seed.id as string);
+        const call = events.find(e => e.type === "response.output_item.added")?.item as Item;
+        assert.equal(call?.type, "function_call");
+        assert.equal(events.filter(e => e.type === "response.function_call_arguments.done").length, 1);
+        assert.equal(events.some(e => e.type === "response.completed"), false);
+        assert.equal(f.rows.length, 2, "No automatic replay after a tool was delivered");
+        f.setTerminalMode("completed");
+        completed(await f.turn([user("explicit retry from last successful response")], seed.id as string));
+        assert.equal(f.rows.length, 3);
+        assert.equal(f.rows[2].request.previous_response_id, undefined);
+        assert.ok(JSON.stringify(f.rows[2].full).includes("retained before interrupted tool"));
+        assert.ok(!f.rows[2].full.some(item => item.call_id === call.call_id));
+        assert.ok(!JSON.stringify(f.rows[2].full).includes("private-request-payload"));
+        assert.equal(f.httpRequests, 0);
+        const log = fs.readFileSync(f.logPath, "utf8");
+        assert.match(log, /\[responses-ws\] \[conn=\d+\] \[session="ses_ws_/);
+        if (terminalMode === "disconnect") {
+            assert.match(log, /upstream failed phase=stream event=close close_code=1011/);
+            assert.match(log, /checkpoint reset reason=upstream-disconnect/);
+        } else assert.ok(log.includes(`checkpoint reset reason=response.${terminalMode}`));
+        assert.doesNotMatch(log, /private-tool-payload|private-request-payload|private-upstream-close-reason|fake-credential/);
+    } finally { await f.close(); }
+});
+}
+
+test("Responses WS faults: cancel after tool delivery and immediately resume with rotated credentials", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        const seedInput = [user("credential rotation preserves completed history")];
+        const seed = completed(await f.turn(seedInput));
+        f.setToolArguments('{"text":"private-tool-payload"}');
+        f.setTerminalMode("hold");
+        const added = nextEvent(f.peer, "response.output_item.added");
+        const delivered = nextEvent(f.peer, "response.function_call_arguments.done");
+        const interrupted = f.turn([user("cancelled request")], seed.id as string);
+        const rejected = assert.rejects(interrupted, /WS client closed/);
+        await delivered;
+        const call = (await added).item as Item;
+        f.peer.close(1000, "private-client-close-reason");
+        const fresh = await f.openPeer("Bearer private-rotated-credential");
+        await rejected;
+        const stale = await f.turn([user("delta on fresh socket")], seed.id as string, {}, fresh);
+        assert.equal((stale[0].error as Item).code, "previous_response_not_found");
+        assert.equal(f.rows.length, 2);
+        f.setTerminalMode("completed");
+        const full = [...seedInput, ...seed.output as Item[], user("resume with full history")];
+        const resumed = completed(await f.turn(full, undefined, {}, fresh));
+        assert.equal(f.rows[2].headers.authorization, "Bearer private-rotated-credential");
+        assert.equal(f.rows[2].request.previous_response_id, undefined);
+        assert.ok(!f.rows[2].full.some(item => item.call_id === call.call_id));
+        const resumedCall = (resumed.output as Item[])[0];
+        completed(await f.turn([{ type: "function_call_output", call_id: resumedCall.call_id, output: "completed once" }], resumed.id as string, {}, fresh));
+        assert.equal(f.rows.at(-1)?.request.previous_response_id, resumed.id);
+        assert.equal(f.connectionCount(), 2);
+        await until(() => _liveUpstreamTimersForTest() === 0);
+        assert.equal(f.httpRequests, 0);
+        const log = fs.readFileSync(f.logPath, "utf8");
+        assert.match(log, /client closed phase=active close_code=1000/);
+        assert.match(log, /client checkpoint reset reason=client-close/);
+        assert.match(log, /client rejected reason=previous_response_not_found/);
+        assert.doesNotMatch(log, /private-tool-payload|private-client-close-reason|private-rotated-credential/);
+    } finally { await f.close(); }
+});
+
+test("Responses WS faults: an overlapping create is rejected without corrupting the active checkpoint", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        f.setToolArguments("{}");
+        f.setTerminalMode("hold");
+        const added = nextEvent(f.peer, "response.output_item.added");
+        const delivered = nextEvent(f.peer, "response.function_call_arguments.done");
+        const active = f.turn([user("active turn")]);
+        await delivered;
+        const call = (await added).item as Item;
+        const busy = nextEvent(f.peer, "error");
+        f.peer.send(JSON.stringify({ type: "response.create", input: [user("must not reach upstream")] }));
+        assert.equal(((await busy).error as Item).code, "response_in_progress");
+        await active;
+        assert.equal(f.rows.length, 1);
+        const done = nextEvent(f.peer, "response.completed");
+        f.setTerminalMode("completed");
+        f.finishHeld();
+        const response = (await done).response as Item;
+        completed(await f.turn([{ type: "function_call_output", call_id: call.call_id, output: "single result" }], response.id as string));
+        assert.equal(f.rows[1].request.previous_response_id, response.id);
+        assert.equal(f.rows[1].full.filter(item => item.call_id === call.call_id).length, 2);
+        assert.ok(!JSON.stringify(f.rows[1].full).includes("must not reach upstream"));
+        assert.match(fs.readFileSync(f.logPath, "utf8"), /client rejected reason=response-in-progress/);
+    } finally { await f.close(); }
+});
+
+for (const code of ["previous_response_not_found", "websocket_connection_limit_reached"]) {
+test(`Responses WS faults: repeated ${code} stops after one transport recovery`, { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        f.setToolArguments("{}");
+        const seed = completed(await f.turn([user("retained retry baseline")]));
+        const call = (seed.output as Item[])[0];
+        const rejection = { type: "error", status: 400, error: { code, message: "private-error-message" } };
+        f.setError(rejection);
+        f.setError(rejection);
+        const events = await f.turn([{ type: "function_call_output", call_id: call.call_id, output: "bounded retry" }], seed.id as string);
+        assert.equal(events.at(-1)?.type, "error");
+        assert.equal((events.at(-1)?.error as Item).code, code);
+        assert.equal(f.rows.length, 3);
+        assert.equal(f.rows[2].request.previous_response_id, undefined);
+        completed(await f.turn([{ type: "function_call_output", call_id: call.call_id, output: "explicit recovery" }], seed.id as string));
+        assert.equal(f.rows.length, 4);
+        assert.equal(f.rows[3].request.previous_response_id, undefined);
+        assert.ok(!JSON.stringify(f.rows[3].full).includes("bounded retry"));
+        const log = fs.readFileSync(f.logPath, "utf8").split("\n").filter(line => line.includes("[responses-ws]")).join("\n");
+        assert.equal((log.match(/upstream retry reason=/g) ?? []).length, 1);
+        assert.match(log, /upstream rejected phase=await-first-event status=400/);
+        assert.doesNotMatch(log, /private-error-message|fake-credential/);
+        assert.equal(f.httpRequests, 0);
+    } finally { await f.close(); }
+});
+}
+
+test("Responses WS faults: refused handshake then a new upstream reconnects without leaking diagnostics", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    const rejected = http.createServer();
+    rejected.on("upgrade", (_req, socket) => socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"));
+    rejected.listen(0, "127.0.0.1");
+    await once(rejected, "listening");
+    const log: string[] = [];
+    const transport = new ResponsesWsUpstream((_level, message) => log.push(message));
+    const body = JSON.stringify({ model: "gpt-5.2", stream: false, input: [user("private-handshake-payload")] });
+    try {
+        const port = (rejected.address() as { port: number }).port;
+        await assert.rejects(transport.fetch(`http://127.0.0.1:${port}/responses?private-query=secret`, { method: "POST", headers: { authorization: "Bearer private-handshake-credential" }, body, signal: AbortSignal.timeout(10000) }), /handshake failed/);
+        const response = await transport.fetch(`${f.upstreamOrigin}/v1/responses`, { method: "POST", body });
+        assert.equal((await response.json() as Item).status, "completed");
+        assert.equal(f.rows.length, 1);
+        assert.equal(f.rows[0].request.previous_response_id, undefined);
+        assert.match(log.join("\n"), /failed phase=handshake event=error close_code=none/);
+        assert.match(log.join("\n"), /checkpoint reset reason=connection-key-changed/);
+        assert.doesNotMatch(log.join("\n"), /private-|secret|Bearer/);
+    } finally {
+        transport.close();
+        await f.close();
+        await new Promise<void>(resolve => rejected.close(() => resolve()));
+    }
+});
+
 for (const terminalOutput of ["full", "empty", "omitted", "partial", "suffix"] as const) {
 test(`Responses WS: actual fold and successive tool results survive ${terminalOutput} terminal output`, { timeout: 30000 }, async () => {
     const f = await fixture();
@@ -487,6 +671,32 @@ test(`Responses WS: actual fold and successive tool results survive ${terminalOu
             }
             assert.ok(!JSON.stringify(next.full).includes("OLD-BULKY-SENTINEL"));
             assert.ok(JSON.stringify(next.full).includes("SUMMARY-WS-FOLD"));
+        }
+        if (terminalOutput === "empty") {
+            for (const fault of ["missing-checkpoint", "idle-disconnect", "connection-limit"] as const) {
+                const response = completed(events);
+                const call = events.find(e => e.type === "response.output_item.done" && (e.item as Item).type === "function_call")?.item as Item;
+                calls.push(call);
+                if (fault === "missing-checkpoint") f.clearUpstreamHistory();
+                if (fault === "idle-disconnect") await f.closeUpstream();
+                if (fault === "connection-limit") f.setError({ type: "error", status: 400, error: { code: "websocket_connection_limit_reached" } });
+                const index = calls.length - 1;
+                events = await f.turn([{ type: "function_call_output", call_id: call.call_id, output: `STATUS_RESULT_${index}` }], response.id as string);
+                completed(events);
+                const next = f.rows.at(-1)!;
+                assert.equal(next.request.previous_response_id, undefined, fault);
+                for (const [i, priorCall] of calls.entries()) {
+                    assert.equal(next.full.filter(item => item.type === "function_call" && item.call_id === priorCall.call_id).length, 1, fault);
+                    assert.equal(next.full.filter(item => item.type === "function_call_output" && item.call_id === priorCall.call_id && item.output === `STATUS_RESULT_${i}`).length, 1, fault);
+                }
+                assert.ok(!JSON.stringify(next.full).includes("OLD-BULKY-SENTINEL"));
+                assert.ok(JSON.stringify(next.full).includes("SUMMARY-WS-FOLD"));
+            }
+            const log = fs.readFileSync(f.logPath, "utf8");
+            assert.match(log, /upstream retry reason=continuation-rejected action=resend-full/);
+            assert.match(log, /upstream checkpoint reset reason=reconnect/);
+            assert.match(log, /upstream retry reason=connection-limit action=reconnect-full/);
+            assert.doesNotMatch(log, /fake-credential|private-idle-close-reason/);
         }
         assert.equal(f.httpRequests, 0);
     } finally { await f.close(); }

@@ -37,6 +37,11 @@ generic opaque WebSocket passthrough, or change the user's OpenCode configuratio
   tool calls and leave orphaned results on the next delta. Terminal items merge
   by item ID; streaming frames remain unchanged. Debug logs report restored
   checkpoint item counts without recording their contents.
+- WS diagnostics identify the local socket and session, failure phase
+  (`handshake`, `await-first-event`, `stream`, or `dispatch`), numeric close code,
+  full/delta request mode, and checkpoint reset/recovery reason. They omit
+  authorization headers, URLs, close-reason text, payloads, and upstream error
+  messages. Normal lifecycle/recovery details use debug; failures use warn.
 - No configuration field, environment variable, package version, persistence
   format, or acp-kernel version is added or changed. Socket checkpoints are
   connection-local; ACP persistence remains unchanged. The ws implementation is
@@ -56,3 +61,13 @@ real OpenCode V2 binary with an isolated configuration and successful fake
 WebSocket upstream; an unavailable socket that merely falls back to HTTP is
 not acceptable evidence. Run typecheck, the full unit suite, build, and the
 required Responses client E2E before submitting a human-reviewed PR.
+
+Failure-combination coverage includes tool arguments delivered before disconnect,
+failed/incomplete terminal events, cancellation followed immediately by a new
+connection with rotated synthetic credentials, overlapping creates, repeated
+continuation/connection-limit errors with bounded retries, and handshake refusal
+followed by recovery. The sparse-output real-fold test also chains a missing
+checkpoint, an idle disconnect, and connection-limit rotation, asserting that
+summaries survive and each completed call/result appears exactly once upstream.
+These are transport/history assertions, not proof of exactly-once execution of
+arbitrary host tools or of the real OAuth refresh lifecycle.
