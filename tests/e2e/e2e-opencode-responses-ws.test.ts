@@ -16,7 +16,8 @@ const repo = path.resolve(import.meta.dirname, "../..");
 const entry = path.join(repo, "dist/agent/opencode-native.js");
 const version = run ? spawnSync(bin, ["--version"], { timeout: 15000 }).stdout?.toString() ?? "" : "";
 
-test("real OpenCode V2: native Responses WebSockets, ACP status, real fold and new upstream chain", {
+for (const sparseTerminal of [false, true]) {
+test(`real OpenCode V2: native Responses WebSockets, fold and post-fold tools (${sparseTerminal ? "sparse" : "full"} terminal output)`, {
     skip: !run ? "set ACP_TEST_E2E_OC_WS=1 (real OpenCode V2, local WS upstream, zero tokens)" : !/v?2\./.test(version) || !fs.existsSync(entry) ? "OpenCode V2 binary and built dist required" : false,
     timeout: 180000,
 }, async (t) => {
@@ -24,6 +25,7 @@ test("real OpenCode V2: native Responses WebSockets, ACP status, real fold and n
     const snapshots = new Map<string, Item[]>();
     const rows: Array<{ transport: "ws" | "http"; body: Item; full: Item[]; headers: http.IncomingHttpHeaders }> = [];
     let serial = 0;
+    let postFoldStatusCalls = 0;
     const itemText = (item: Item | undefined): string => typeof item?.content === "string" ? item.content : Array.isArray(item?.content) ? item.content.map(part => typeof part === "object" && part !== null ? String((part as Item).text ?? "") : "").join("\n") : "";
     const reply = (body: Item, headers: http.IncomingHttpHeaders, transport: "ws" | "http", send: (event: Item) => void) => {
         const prior = typeof body.previous_response_id === "string" ? snapshots.get(body.previous_response_id) : undefined;
@@ -36,12 +38,18 @@ test("real OpenCode V2: native Responses WebSockets, ACP status, real fold and n
         const foldEncoded = itemText(lastUser).match(/WS_FOLD_REQUEST_B64 ([A-Za-z0-9+/=]+)/)?.[1];
         const fold = foldEncoded ? Buffer.from(foldEncoded, "base64").toString("utf8") : undefined;
         const foldDone = full.some(item => item.type === "function_call" && item.name === "compress") && full.some(item => item.type === "function_call_output" && String(item.output).includes("Compressed"));
-        const name = fold && !foldDone ? "compress" : hasStatus && !statusCalled ? "acp_status" : undefined;
+        const compressIndex = full.findIndex(item => item.type === "function_call" && item.name === "compress");
+        const postFoldStatus = full.slice(compressIndex + 1).find(item => item.type === "function_call" && item.name === "acp_status");
+        const postFoldResult = postFoldStatus && full.some(item => item.type === "function_call_output" && item.call_id === postFoldStatus.call_id);
+        let name = fold ? !foldDone ? "compress" : !postFoldResult ? "acp_status" : undefined : hasStatus && !statusCalled ? "acp_status" : undefined;
+        if (foldDone && name === "acp_status") postFoldStatusCalls++;
+        const text = postFoldStatusCalls > 1 ? "WS_E2E_REPEATED_TOOL" : "WS_E2E_OK";
+        if (postFoldStatusCalls > 1) name = undefined;
         const id = `resp_e2e_ws_${++serial}`;
         const args = name === "compress" ? fold! : "{}";
         const item: Item = name
             ? { type: "function_call", id: `fc_${id}`, call_id: `call_${id}`, name, arguments: args, status: "completed" }
-            : { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "WS_E2E_OK", annotations: [] }] };
+            : { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
         let sequence = 0;
         const event = (type: string, data: Item) => send({ type, sequence_number: sequence++, ...data });
         event("response.created", { response: { id, object: "response", status: "in_progress", output: [] } });
@@ -51,13 +59,13 @@ test("real OpenCode V2: native Responses WebSockets, ACP status, real fold and n
             event("response.function_call_arguments.done", { item_id: item.id, output_index: 0, arguments: args });
         } else {
             event("response.content_part.added", { item_id: item.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
-            event("response.output_text.delta", { item_id: item.id, output_index: 0, content_index: 0, delta: "WS_E2E_OK" });
-            event("response.output_text.done", { item_id: item.id, output_index: 0, content_index: 0, text: "WS_E2E_OK" });
+            event("response.output_text.delta", { item_id: item.id, output_index: 0, content_index: 0, delta: text });
+            event("response.output_text.done", { item_id: item.id, output_index: 0, content_index: 0, text });
             event("response.content_part.done", { item_id: item.id, output_index: 0, content_index: 0, part: (item.content as Item[])[0] });
         }
         event("response.output_item.done", { output_index: 0, item });
         snapshots.set(id, [...full, item]);
-        event("response.completed", { response: { id, object: "response", model: body.model, status: "completed", output: [item], usage: { input_tokens: 500, output_tokens: 10, total_tokens: 510, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } });
+        event("response.completed", { response: { id, object: "response", model: body.model, status: "completed", output: sparseTerminal && foldDone ? [] : [item], usage: { input_tokens: 500, output_tokens: 10, total_tokens: 510, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } });
     };
     const upstream = http.createServer(async (req, res) => {
         if (req.method !== "POST") { res.writeHead(404).end(); return; }
@@ -122,11 +130,18 @@ test("real OpenCode V2: native Responses WebSockets, ACP status, real fold and n
     for (let i = 0; i < 3; i++) await ocRun(`push-back round ${i}`, sid as string);
     const foldArgs = { content: [{ startId: ref, endId: ref, summary: "E2E-WS-SUMMARY: the original material consisted of deterministic bulky filler and established the WebSocket ACP integration test context." }] };
     await ocRun(`WS_FOLD_REQUEST_B64 ${Buffer.from(JSON.stringify(foldArgs)).toString("base64")}`, sid as string);
-    const final = rows.filter(row => row.transport === "ws").at(-1)!;
+    const afterFold = rows.filter(row => row.transport === "ws" && row.full.some(item => item.type === "function_call_output" && String(item.output).includes("Compressed")));
+    assert.equal(afterFold.length, 2);
+    assert.equal(postFoldStatusCalls, 1, "A completed status tool must not be requested again after a fold");
+    const final = afterFold.at(-1)!;
     assert.ok(!JSON.stringify(final.full).includes("E2E-WS-BULKY-SENTINEL"));
     assert.ok(JSON.stringify(final.full).includes("E2E-WS-SUMMARY"));
-    assert.equal(final.body.previous_response_id, undefined);
+    assert.equal(afterFold[0].body.previous_response_id, undefined);
+    assert.equal(typeof final.body.previous_response_id, "string");
     assert.ok(final.full.some(item => item.type === "function_call_output" && String(item.output).includes("Compressed")));
+    const statusCall = [...final.full].reverse().find(item => item.type === "function_call" && item.name === "acp_status");
+    assert.ok(statusCall);
+    assert.ok(final.full.some(item => item.type === "function_call_output" && item.call_id === statusCall.call_id && String(item.output).includes("ACP Context Analysis")));
     assert.ok(rows.filter(row => row.transport === "http").every(row => row.headers["x-bili-plugin-agent"] === "title"), "Primary requests must never fall back to HTTP");
     const log = fs.readFileSync(path.join(dirs.state, "billion-context/bili.log"), "utf8");
     assert.match(log, /tool compress executed via plugin/);
@@ -134,3 +149,4 @@ test("real OpenCode V2: native Responses WebSockets, ACP status, real fold and n
     assert.match(log, /acp-usage/);
     t.diagnostic(`OpenCode ${version.trim()}, evidence: ${root}`);
 });
+}

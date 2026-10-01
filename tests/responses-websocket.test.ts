@@ -67,7 +67,7 @@ test("V2 handshake: routes OAuth/API Responses sockets and stamps native identit
     } finally { cleanup(); }
 });
 
-async function fixture() {
+async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" | "suffix" = "full") {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-responses-ws-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -76,6 +76,7 @@ async function fixture() {
     let httpRequests = 0;
     let serial = 0;
     let toolArguments: string | undefined;
+    let toolName = "write";
     let nextError: Item | undefined;
     let stalled = false;
     let disconnect = false;
@@ -95,21 +96,28 @@ async function fixture() {
         if (request.previous_response_id && !previous) { peer.send(JSON.stringify({ type: "error", status: 400, error: { code: "previous_response_not_found", message: "missing upstream checkpoint" } })); return; }
         const id = `resp_ws_${++serial}`;
         const item: Item = toolArguments !== undefined
-            ? { type: "function_call", id: `fc_${id}`, call_id: `call_${id}`, name: "write", arguments: toolArguments, status: "completed" }
+            ? { type: "function_call", id: `fc_${id}`, call_id: `call_${id}`, name: toolName, arguments: toolArguments, status: "completed" }
             : { type: "message", id: `msg_${id}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: `ok-${serial}`, annotations: [] }] };
         const send = (type: string, fields: Item) => peer.send(JSON.stringify({ type, ...fields }));
+        const prefix: Item[] = terminalOutput === "partial" || terminalOutput === "suffix" ? [{ type: "reasoning", id: `rs_${id}`, summary: [], encrypted_content: `opaque-${serial}` }] : [];
+        const outputIndex = prefix.length;
+        const output = [...prefix, item];
         send("response.created", { response: { id, status: "in_progress", output: [] } });
-        send("response.output_item.added", { output_index: 0, item: { ...item, status: "in_progress", ...(toolArguments === undefined ? { content: [] } : { arguments: "" }) } });
-        if (toolArguments !== undefined) {
-            send("response.function_call_arguments.delta", { item_id: item.id, output_index: 0, delta: toolArguments });
-            send("response.function_call_arguments.done", { item_id: item.id, output_index: 0, arguments: toolArguments });
-        } else {
-            send("response.output_text.delta", { item_id: item.id, output_index: 0, content_index: 0, delta: `ok-${serial}` });
-            send("response.output_text.done", { item_id: item.id, output_index: 0, content_index: 0, text: `ok-${serial}` });
+        for (const [index, part] of prefix.entries()) {
+            send("response.output_item.added", { output_index: index, item: part });
+            send("response.output_item.done", { output_index: index, item: part });
         }
-        send("response.output_item.done", { output_index: 0, item });
-        snapshots.set(id, [...full, item]);
-        send("response.completed", { response: { id, object: "response", status: "completed", output: [item], usage: { input_tokens: 500, output_tokens: 10, total_tokens: 510 } } });
+        send("response.output_item.added", { output_index: outputIndex, item: { ...item, status: "in_progress", ...(toolArguments === undefined ? { content: [] } : { arguments: "" }) } });
+        if (toolArguments !== undefined) {
+            send("response.function_call_arguments.delta", { item_id: item.id, output_index: outputIndex, delta: toolArguments });
+            send("response.function_call_arguments.done", { item_id: item.id, output_index: outputIndex, arguments: toolArguments });
+        } else {
+            send("response.output_text.delta", { item_id: item.id, output_index: outputIndex, content_index: 0, delta: `ok-${serial}` });
+            send("response.output_text.done", { item_id: item.id, output_index: outputIndex, content_index: 0, text: `ok-${serial}` });
+        }
+        send("response.output_item.done", { output_index: outputIndex, item });
+        snapshots.set(id, [...full, ...output]);
+        send("response.completed", { response: { id, object: "response", status: "completed", ...(terminalOutput === "omitted" ? {} : { output: terminalOutput === "full" ? output : terminalOutput === "suffix" ? [item] : prefix }), usage: { input_tokens: 500, output_tokens: 10, total_tokens: 510 } } });
     }));
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
@@ -146,9 +154,10 @@ async function fixture() {
         setError: (error: Item) => { nextError = error; },
         setStalled: (value: boolean) => { stalled = value; },
         disconnectNext: () => { disconnect = true; },
+        setTerminalOutput: (value: typeof terminalOutput) => { terminalOutput = value; },
         clearUpstreamHistory: () => { snapshots.clear(); },
         upstreamPeers: () => wss.clients.size,
-        setToolArguments: (args: string) => { toolArguments = args; }, get httpRequests() { return httpRequests; }, close: async () => {
+        setToolArguments: (args: string, name = "write") => { toolArguments = args; toolName = name; }, get httpRequests() { return httpRequests; }, close: async () => {
         peer.terminate();
         for (const client of wss.clients) client.terminate();
         await Promise.all([new Promise<void>(resolve => proxy.close(() => resolve())), new Promise<void>(resolve => upstream.close(() => resolve()))]);
@@ -276,6 +285,30 @@ test("Responses WS: non-streaming pipeline requests use WS and return the comple
     } finally { transport.close(); await f.close(); }
 });
 
+for (const terminalOutput of ["empty", "omitted", "partial", "suffix"] as const) {
+    test(`Responses WS: non-streaming ${terminalOutput} terminal output includes streamed results and supports continuation`, async () => {
+        const f = await fixture(terminalOutput);
+        const transport = new ResponsesWsUpstream();
+        try {
+            const input = [user("preflight with streamed output")];
+            const first = await transport.fetch(`${f.upstreamOrigin}/v1/responses`, { method: "POST", body: JSON.stringify({ model: "gpt-5.2", stream: false, input }) });
+            const body = await first.json() as Item;
+            const output = body.output as Item[];
+            assert.ok(output.some(item => item.type === "message" && JSON.stringify(item.content).includes("ok-1")));
+            if (terminalOutput === "partial" || terminalOutput === "suffix") {
+                assert.deepEqual(output.map(item => item.type), ["reasoning", "message"]);
+                assert.equal(output[0].encrypted_content, "opaque-1");
+            }
+            const next = await transport.fetch(`${f.upstreamOrigin}/v1/responses`, { method: "POST", body: JSON.stringify({ model: "gpt-5.2", stream: false, input: [...input, ...output, user("next preflight")] }) });
+            const nextBody = await next.json() as Item;
+            assert.equal(f.rows.at(-1)?.request.previous_response_id, body.id);
+            assert.ok(JSON.stringify(nextBody.output).includes("ok-2"));
+            assert.ok(!JSON.stringify(nextBody.output).includes("ok-1"));
+            assert.equal(f.httpRequests, 0);
+        } finally { transport.close(); await f.close(); }
+    });
+}
+
 test("Responses WS: completed and failed sessions do not share socket checkpoints", async () => {
     const a = await fixture();
     const b = await fixture();
@@ -399,7 +432,8 @@ test("Responses WS: unknown continuation returns an explicit retry-full error", 
     } finally { await f.close(); }
 });
 
-test("Responses WS: actual plugin compression resets the upstream chain and carries its summary", { timeout: 30000 }, async () => {
+for (const terminalOutput of ["full", "empty", "omitted", "partial", "suffix"] as const) {
+test(`Responses WS: actual fold and successive tool results survive ${terminalOutput} terminal output`, { timeout: 30000 }, async () => {
     const f = await fixture();
     try {
         const seed = completed(await f.turn([user("session purpose: WebSocket ACP integration")]));
@@ -414,16 +448,47 @@ test("Responses WS: actual plugin compression resets the upstream chain and carr
         const out = await result.json() as { ok: boolean; result: string };
         assert.equal(out.ok, true, JSON.stringify(out));
         assert.match(out.result, /Compressed/);
-        completed(await f.turn([
+        f.setTerminalOutput(terminalOutput);
+        f.setToolArguments("{}", "acp_status");
+        let events = await f.turn([
             { type: "function_call", id: "fc_compress", call_id: "call_compress", name: "compress", arguments: JSON.stringify(args) },
             { type: "function_call_output", call_id: "call_compress", output: out.result },
             user("continue after fold"),
-        ], previous));
+        ], previous);
+        completed(events);
         const row = f.rows.at(-1)!;
         assert.equal(row.request.previous_response_id, undefined);
         assert.ok(!JSON.stringify(row.full).includes("OLD-BULKY-SENTINEL"), JSON.stringify(row.full.filter(item => JSON.stringify(item).includes("OLD-BULKY-SENTINEL")).map(item => ({ ...item, content: JSON.stringify(item.content).slice(0,180) }))));
         assert.ok(JSON.stringify(row.full).includes("SUMMARY-WS-FOLD"));
         assert.ok(peekSession(f.sid)?.state.blocks.some(b => b.active));
+        const calls: Item[] = [];
+        for (let i = 0; i < 3; i++) {
+            const response = completed(events);
+            const call = events.find(e => e.type === "response.output_item.done" && (e.item as Item).type === "function_call")?.item as Item;
+            assert.ok(call);
+            calls.push(call);
+            if (terminalOutput === "empty") assert.deepEqual(response.output, []);
+            if (terminalOutput === "omitted") assert.equal(response.output, undefined);
+            if (terminalOutput === "suffix") assert.deepEqual(response.output, [call]);
+            const output = `STATUS_RESULT_${i}`;
+            events = await f.turn([{ type: "function_call_output", call_id: call.call_id, output }], response.id as string);
+            completed(events);
+            const next = f.rows.at(-1)!;
+            assert.equal(next.request.previous_response_id, response.id);
+            if (terminalOutput === "partial" || terminalOutput === "suffix") {
+                const callIndex = next.full.findIndex(item => item.id === call.id);
+                assert.equal(next.full[callIndex - 1]?.type, "reasoning");
+                assert.equal(next.full[callIndex - 1]?.id, `rs_${response.id}`);
+                assert.equal(typeof next.full[callIndex - 1]?.encrypted_content, "string");
+            }
+            for (const [index, priorCall] of calls.entries()) {
+                assert.ok(next.full.some(item => item.type === "function_call" && item.call_id === priorCall.call_id), `Missing call ${index} in ${terminalOutput} continuation`);
+                assert.ok(next.full.some(item => item.type === "function_call_output" && item.call_id === priorCall.call_id && item.output === `STATUS_RESULT_${index}`), `Missing result ${index} in ${terminalOutput} continuation`);
+            }
+            assert.ok(!JSON.stringify(next.full).includes("OLD-BULKY-SENTINEL"));
+            assert.ok(JSON.stringify(next.full).includes("SUMMARY-WS-FOLD"));
+        }
         assert.equal(f.httpRequests, 0);
     } finally { await f.close(); }
 });
+}

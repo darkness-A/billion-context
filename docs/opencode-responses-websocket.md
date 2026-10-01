@@ -32,6 +32,11 @@ generic opaque WebSocket passthrough, or change the user's OpenCode configuratio
 - Only completed responses establish continuation checkpoints. Disconnect,
   cancellation, failed/incomplete responses, and unknown response IDs do not
   fabricate successful history. Checkpoints and queued payloads are bounded.
+- Both checkpoints accumulate `response.output_item.done` items by output index.
+  Empty, missing, or partial terminal `response.output` must not erase completed
+  tool calls and leave orphaned results on the next delta. Terminal items merge
+  by item ID; streaming frames remain unchanged. Debug logs report restored
+  checkpoint item counts without recording their contents.
 - No configuration field, environment variable, package version, persistence
   format, or acp-kernel version is added or changed. Socket checkpoints are
   connection-local; ACP persistence remains unchanged. The ws implementation is
@@ -43,6 +48,8 @@ Use random loopback ports and fake Responses WebSocket upstreams, with no real
 credentials or model usage. Prove both directions stay on WebSocket, normal
 continuation is incremental, a real ACP fold resets the upstream history,
 tool argument payloads survive unchanged, usage reaches the existing session,
+and successive tool calls/results still advance history after a fold even when
+the terminal output is sparse,
 and unknown upgrades retain 426. Verify upstream proxy routing, errors,
 cancellation, reconnect, checkpoint misses, and session isolation. Exercise a
 real OpenCode V2 binary with an isolated configuration and successful fake

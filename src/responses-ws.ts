@@ -35,6 +35,37 @@ interface Checkpoint {
     output: unknown[];
 }
 
+class ResponsesWsOutput {
+    private items = new Map<number, { item: JsonObject; bytes: number }>();
+    private bytes = 0;
+
+    observe(frame: JsonObject): JsonObject | undefined {
+        if (frame.type === "response.created") {
+            this.items.clear();
+            this.bytes = 0;
+        }
+        if (frame.type === "response.output_item.done" && object(frame.item) && Number.isSafeInteger(frame.output_index) && (frame.output_index as number) >= 0) {
+            const index = frame.output_index as number;
+            const bytes = Buffer.byteLength(JSON.stringify(frame.item));
+            this.bytes += bytes - (this.items.get(index)?.bytes ?? 0);
+            if (this.bytes > MAX_REQUEST_BYTES) throw new Error("Responses WebSocket checkpoint buffer limit exceeded");
+            this.items.set(index, { item: frame.item, bytes });
+        }
+        if (frame.type !== "response.completed" || !object(frame.response)) return undefined;
+        // Terminal output can be sparse; retain items already delivered by the stream.
+        const response = frame.response;
+        const output = new Map<number, unknown>([...this.items].map(([index, value]) => [index, value.item]));
+        const indexes = new Map([...this.items].flatMap(([index, value]) => typeof value.item.id === "string" ? [[value.item.id, index] as const] : []));
+        if (Array.isArray(response.output)) {
+            response.output.forEach((item: unknown, index: number) => {
+                const slot = object(item) && typeof item.id === "string" ? indexes.get(item.id) : undefined;
+                output.set(slot ?? index, item);
+            });
+        }
+        return { ...response, output: [...output].sort(([a], [b]) => a - b).map(([, item]) => item) };
+    }
+}
+
 export class ResponsesWsHistory {
     private checkpoint?: Checkpoint;
 
@@ -130,6 +161,7 @@ export class ResponsesWsUpstream {
         if (this.active) throw new Error("Responses WebSocket exchange already active");
         const request = this.history.continuation(body);
         return new Promise<Response>((resolve, reject) => {
+            const output = new ResponsesWsOutput();
             let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
             let settled = false;
             let ended = false;
@@ -158,6 +190,7 @@ export class ResponsesWsUpstream {
                     if (typeof event.data !== "string" || Buffer.byteLength(event.data) > MAX_REQUEST_BYTES) throw new Error("Invalid or oversized Responses WebSocket frame");
                     const frame: unknown = JSON.parse(event.data);
                     if (!object(frame) || typeof frame.type !== "string") throw new Error("Invalid Responses WebSocket event");
+                    const completed = output.observe(frame);
                     if (frame.type === "error" && !settled) {
                         const error = object(frame.error) ? frame.error : {};
                         if (rotateRetry && error.code === "websocket_connection_limit_reached") {
@@ -181,8 +214,9 @@ export class ResponsesWsUpstream {
                     if (stream !== true) {
                         if (frame.type === "response.completed" || frame.type === "response.failed" || frame.type === "response.incomplete") {
                             clean();
-                            this.history.commit(body, frame.response);
-                            resolve(new Response(JSON.stringify(frame.response), { headers: { "content-type": "application/json" } }));
+                            this.history.clear();
+                            this.history.commit(body, completed);
+                            resolve(new Response(JSON.stringify(completed ?? frame.response), { headers: { "content-type": "application/json" } }));
                         } else if (frame.type === "error") fail(new Error("Responses WebSocket upstream error"));
                         return;
                     }
@@ -199,7 +233,7 @@ export class ResponsesWsUpstream {
                     if (frame.type === "response.completed" || frame.type === "response.failed" || frame.type === "response.incomplete" || frame.type === "error") {
                         clean();
                         this.history.clear();
-                        this.history.commit(body, frame.response);
+                        this.history.commit(body, completed);
                         controller?.close();
                     }
                 } catch (error) {
@@ -230,7 +264,9 @@ class ResponsesWsResponse extends http.ServerResponse {
     private sent = false;
     private buffer = "";
     private readonly decoder = new TextDecoder();
+    private readonly output = new ResponsesWsOutput();
     response?: JsonObject;
+    restoredOutputItems = 0;
     terminal = false;
 
     constructor(req: http.IncomingMessage, private readonly peer: WebSocket) {
@@ -256,7 +292,12 @@ class ResponsesWsResponse extends http.ServerResponse {
             if (!data || data === "[DONE]") continue;
             const frame: unknown = JSON.parse(data);
             if (object(frame)) {
-                if (frame.type === "response.completed" && object(frame.response)) this.response = frame.response;
+                const completed = this.output.observe(frame);
+                if (completed) {
+                    this.response = completed;
+                    const terminal = object(frame.response) && Array.isArray(frame.response.output) ? frame.response.output.length : 0;
+                    this.restoredOutputItems = (completed.output as unknown[]).length - terminal;
+                }
                 if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(frame.type))) this.terminal = true;
             }
             if (this.peer.readyState === WebSocket.OPEN) this.peer.send(data, { binary: false });
@@ -368,7 +409,10 @@ export function installResponsesWebSocket(
                     void withFetchTransport((url, options) => transport.fetch(url, options), async () => {
                         try {
                             await dispatch(req, res);
-                            if (res.response) history.commit(body, res.response);
+                            if (res.response) {
+                                history.commit(body, res.response);
+                                if (res.restoredOutputItems > 0) log("debug", `[responses-ws] [${conversation}] checkpoint restored ${res.restoredOutputItems} streamed output item(s) absent from terminal output`);
+                            }
                         } catch {
                             log("warn", "[responses-ws] exchange failed");
                             if (!res.writableEnded) res.end();
