@@ -127,6 +127,8 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { installResponsesWebSocket } from "./responses-ws.js";
+import { currentFetchTransport } from "./fetch-transport.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
@@ -418,7 +420,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // as the context-window source for zero-config `/p/` routes that have no
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
-    const server = http.createServer(async (req, res) => {
+    const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
         const connRec = connRecords.get(req.socket);
         if (connRec) {
@@ -448,13 +450,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 res.end();
             }
         }
-    });
-    // Bili does not support WebSocket. An explicit 'upgrade' listener is
+    };
+    const server = http.createServer(dispatch);
+    const responsesUpgrade = installResponsesWebSocket(server, dispatch, log);
+    // Unclaimed upgrades retain the immediate HTTP fallback contract.
+    // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
     // versions destroy the socket with no response), delaying clients with
     // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
     // HTTP POST immediately.
-    server.on("upgrade", (req, socket) => {
+    server.on("upgrade", (req, socket, head) => {
+        if (responsesUpgrade(req, socket, head)) return;
         log("info", `[ws] rejected ${req.method} ${maskUrlsInText(req.url ?? "")} host=${req.headers.host ? maskHostPortForLog(req.headers.host) : "?"} with 426`);
         socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
         const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
@@ -5574,7 +5580,9 @@ async function forward(
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
     // proxied URL is the only useful signal in the log.
-    log("info", `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
+    log("info", currentFetchTransport()
+        ? `forward WS → ${maskUrlForLog(upstreamUrl.replace(/^http/, "ws"))}`
+        : `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
@@ -6889,7 +6897,8 @@ function formatBytes(n: number): string {
 function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
-    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms`);
+    const view = currentFetchTransport() ? ", view=ws-expanded" : "";
+    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
 }
 
 /** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.

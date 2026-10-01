@@ -467,6 +467,26 @@ healthy, requests go direct (uncompressed) with a one-time warning and
 recover automatically. Under a `bili opencode` launch this entry is skipped
 entirely (the launcher owns the proxy).
 
+### OpenAI Responses WebSockets (V2)
+
+The V2 plugin also intercepts OpenAI `experimental.ws.handshake` requests.
+Both legs use WebSocket: OpenCode → bili → the Responses upstream. This
+includes API-key OpenAI and ChatGPT Pro/Plus browser/headless OAuth; the login
+method does not select the transport. No OpenCode configuration rewrite or
+new bili setting is required. The socket must originate locally and carry
+the cooperative plugin identity; generic or unclaimed upgrades retain 426.
+
+ACP processing, native tools and usage accounting stay active. Client deltas
+are expanded before compression. Upstream deltas are used only when the
+processed history exactly extends the previous response; a fold starts a new
+chain with full compressed input on the same socket. Ref tagging or other
+history edits can also require full input, so connection reuse does not imply
+every turn is incremental. Older hosts without the experimental hook must
+use OpenCode's existing `providers.openai.settings.transport: "http"` setting.
+Realtime, multiplexed concurrent responses, and remote WS clients are outside
+this integration's scope. Verification: real OpenCode V2.0.20 with a local
+Responses WS upstream, not live OpenAI/ChatGPT credentials.
+
 ### Pure proxy (no plugin)
 
 Point the provider baseURL at the proxy like any other client:

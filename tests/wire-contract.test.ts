@@ -52,9 +52,14 @@ import {
     retrieveToolsFor,
     IMAGE_FULL_TOOL_GOOGLE,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, VALIDATORS, startFakeUpstream, type Wire } from "./wire-contract-fakes.ts";
+import { WIRE_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
+
+test("WC-013: WebSocket transport envelopes omit HTTP-only fields", () => {
+    assert.deepEqual(validateResponsesWsCreate({ type: "response.create", input: [] }), []);
+    for (const key of ["stream", "background", "stream_options"]) assert.match(validateResponsesWsCreate({ type: "response.create", [key]: true })[0], /WC-013/);
+});
 
 test("WC-012 validates compaction IDs without changing function-call ID rules", () => {
     assert.deepEqual(VALIDATORS.responses({ input: [{ type: "compaction", id: "cmp_real", encrypted_content: "opaque" }] }), []);
@@ -110,6 +115,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
         ],
         responses: [
+            { type: "response.create", input: [], stream: true },
             { input: [{ type: "compaction", id: "fc_bili_local", encrypted_content: "bili:acp:summary" }] },
             { tools: [{ type: "function", name: "bad name", parameters: { type: "object", properties: {} } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "array" } }] },

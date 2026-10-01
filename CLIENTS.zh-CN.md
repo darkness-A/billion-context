@@ -139,6 +139,23 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 
 加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该条目整体跳过(代理归启动器管)。
 
+### OpenAI Responses WebSocket(V2)
+
+V2 插件也接管 OpenAI 的 `experimental.ws.handshake` 请求，两端均使用
+WebSocket：OpenCode → bili → Responses 上游。支持 OpenAI API Key 及
+ChatGPT Pro/Plus browser/headless OAuth；登录方式不决定传输方式。
+无需改写 OpenCode 配置或增加 bili 设置。首版只接受本机发起、携带原生
+插件身份的连接；普通或未接管的 WebSocket 升级仍立即返回 426。
+
+ACP 处理、原生工具和用量统计保持生效。客户端增量先还原再压缩；只有
+处理后的历史确实延续上次响应时，上游才使用增量。压缩后在同一连接上
+发送完整压缩上下文，开始新的响应链。引用标签或其它历史变化也可能要求
+完整输入，因此复用连接不代表每轮都只发增量。不支持实验钩子的旧宿主
+需要使用 OpenCode 已有的 `providers.openai.settings.transport: "http"`。
+Realtime、同一连接的并发多路响应及远程 WS 客户端不在本次范围。
+验证使用真实 OpenCode V2.0.20 与本地 Responses WS 上游，未使用真实
+OpenAI/ChatGPT 凭据。
+
 ### 纯代理(无插件)
 
 与其它客户端一样,把 provider baseURL 指向代理:

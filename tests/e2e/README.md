@@ -1,5 +1,24 @@
 # E2E: real codex client through bili against a real upstream
 
+## OpenCode V2 Responses WebSocket regression
+
+`e2e-opencode-responses-ws.test.ts` runs the real OpenCode V2 binary against
+its own loopback Responses WebSocket upstream. It verifies native socket
+interception, ACP status execution, real compression, full-history chain reset
+after a fold, and usage accounting. Primary requests must remain WebSocket;
+HTTP title-generation requests are allowed. Configuration, credentials, state
+and working directory are isolated; no real model tokens are consumed.
+
+```bash
+npm run build
+ACP_TEST_E2E_OC_WS=1 node --import tsx --test tests/e2e/e2e-opencode-responses-ws.test.ts
+```
+
+`E2E_OC_BIN` selects the OpenCode binary. The suite skips by default and requires
+a V2 binary. Evidence is retained in its reported temporary directory.
+The native OpenCode CI workflow runs it in a separate job pinned to V2.0.20;
+the existing V2.0.3 Chat Completions coverage remains unchanged.
+
 This suite runs the **real `codex` CLI** against a **real Responses-compatible
 upstream** through the bili proxy, and asserts the full context-management
 lifecycle end-to-end:

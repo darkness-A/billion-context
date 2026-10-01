@@ -27,6 +27,12 @@ export interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        id: "WC-013",
+        wire: "responses",
+        summary: "Responses WebSocket requests use response.create and omit HTTP-only stream/background/stream_options fields",
+        provenance: "OpenAI WebSocket mode guide https://developers.openai.com/api/docs/guides/websocket-mode/ (transport-specific stream/background fields are not used); OpenCode v2.0.20 open-responses-channel.ts removes these fields; bili #1844 adds a WS transport rather than sending HTTP envelopes verbatim.",
+    },
+    {
         id: "WC-012",
         wire: "responses",
         summary: "a supplied compaction input item id must begin with cmp",
@@ -220,6 +226,7 @@ function validateGeminiSchema(schema: unknown, path: string, out: string[]): voi
 export function validateResponsesBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    if (body.type === "response.create") out.push(...validateResponsesWsCreate(body));
     // WC-011 (#1733): runs before the tools early-return — the adjacency ban
     // applies to any array input, tools or not.
     if (Array.isArray(body.input)) {
@@ -288,6 +295,11 @@ export function validateResponsesBody(body: unknown): string[] {
         closeRun(body.input.length - 1);
     }
     return out;
+}
+
+export function validateResponsesWsCreate(body: unknown): string[] {
+    if (!isPlainObject(body) || body.type !== "response.create") return ["WC-013: expected response.create WebSocket event"];
+    return ["stream", "stream_options", "background"].filter(key => key in body).map(key => `WC-013: HTTP-only ${key} must not reach WebSocket response.create`);
 }
 
 /** WC-006 on a Gemini generateContent/streamGenerateContent body. */

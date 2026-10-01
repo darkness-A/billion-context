@@ -32,7 +32,7 @@ export function proxyBaseFromUrl(baseUrl: string | undefined): string | undefine
         const segments = url.pathname.split("/").filter((s) => s.length > 0);
         if (segments[0] !== "bili") return undefined;
         const rest = url.pathname.slice(url.pathname.indexOf("bili") + "bili".length);
-        if (!/^\/https?:\/\//.test(rest)) return undefined;
+        if (!/^\/(?:responses\/)?https?:\/\//.test(rest)) return undefined;
         return `${url.protocol}//${url.host}`;
     } catch {
         return undefined;

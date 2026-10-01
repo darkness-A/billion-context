@@ -1,0 +1,389 @@
+import http from "node:http";
+import type { Duplex } from "node:stream";
+import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
+import WebSocket, { WebSocketServer } from "ws";
+import { MAX_REQUEST_BYTES, type FetchOptions } from "./fetch-util.js";
+import { withFetchTransport } from "./fetch-transport.js";
+import { checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
+import { isLoopbackAddress } from "./util.js";
+import { connectionNamedHeaders, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { normalizeSseLineEndings } from "./sse-util.js";
+
+type JsonObject = Record<string, unknown>;
+
+function object(value: unknown): value is JsonObject {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function canonical(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (object(value)) return `{${Object.keys(value).filter(k => value[k] !== undefined).sort().map(k => `${JSON.stringify(k)}:${canonical(value[k])}`).join(",")}}`;
+    return JSON.stringify(value) ?? "null";
+}
+
+function comparable(item: unknown): unknown {
+    if (!object(item)) return item;
+    const result = { ...item };
+    delete result.status;
+    if (!result.type && typeof result.role === "string") result.type = "message";
+    return result;
+}
+
+interface Checkpoint {
+    id: string;
+    request: JsonObject;
+    output: unknown[];
+}
+
+export class ResponsesWsHistory {
+    private checkpoint?: Checkpoint;
+
+    expand(frame: JsonObject): JsonObject {
+        const { type: _type, previous_response_id: previous, ...request } = frame;
+        if (typeof request.input === "string") request.input = [{ type: "message", role: "user", content: request.input }];
+        if (!Array.isArray(request.input)) throw new Error("response.create requires an input array");
+        if (previous !== undefined && previous !== null) {
+            if (previous !== this.checkpoint?.id) throw new Error("previous_response_not_found");
+            const prior = this.checkpoint;
+            if (!prior || !Array.isArray(prior.request.input)) throw new Error("previous_response_not_found");
+            return { ...prior.request, ...request, input: [...prior.request.input, ...prior.output, ...request.input] };
+        }
+        return request;
+    }
+
+    continuation(request: JsonObject): JsonObject {
+        const prior = this.checkpoint;
+        if (!prior || !Array.isArray(request.input) || !Array.isArray(prior.request.input)) return request;
+        const { input: _input, ...fields } = request;
+        const items = request.input;
+        const { input: _priorInput, ...priorFields } = prior.request;
+        if (canonical(fields) !== canonical(priorFields)) return request;
+        const baseline = [...prior.request.input, ...prior.output];
+        if (items.length <= baseline.length || !baseline.every((item, i) => canonical(comparable(item)) === canonical(comparable(items[i])))) return request;
+        return { ...fields, input: items.slice(baseline.length), previous_response_id: prior.id };
+    }
+
+    commit(request: JsonObject, response: unknown): void {
+        if (!object(response) || response.status !== "completed" || typeof response.id !== "string" || !Array.isArray(response.output)) return;
+        if (Buffer.byteLength(JSON.stringify(request)) + Buffer.byteLength(JSON.stringify(response.output)) > MAX_REQUEST_BYTES) {
+            this.clear();
+            return;
+        }
+        this.checkpoint = { id: response.id, request, output: response.output };
+    }
+
+    clear(): void {
+        this.checkpoint = undefined;
+    }
+}
+
+export class ResponsesWsUpstream {
+    private socket?: InstanceType<typeof UpstreamWebSocket>;
+    private key?: string;
+    private history = new ResponsesWsHistory();
+    private active?: { fail: (error: Error) => void };
+
+    close(): void {
+        const socket = this.socket;
+        this.socket = undefined;
+        this.key = undefined;
+        this.history.clear();
+        this.active?.fail(new Error("Responses WebSocket closed"));
+        if (socket && socket.readyState < UpstreamWebSocket.CLOSING) socket.close();
+    }
+
+    private async connect(url: string, options: FetchOptions): Promise<InstanceType<typeof UpstreamWebSocket>> {
+        const headers = Object.fromEntries(new Headers(options.headers).entries());
+        for (const key of Object.keys(headers)) if (UPSTREAM_HOP_HEADERS.has(key) || key.startsWith("sec-websocket-")) delete headers[key];
+        const wsUrl = url.replace(/^http/, "ws");
+        const key = `${wsUrl}:${canonical(headers)}`;
+        if (this.key === key && this.socket?.readyState === UpstreamWebSocket.OPEN) return this.socket;
+        this.close();
+        const socket = new UpstreamWebSocket(wsUrl, { headers, dispatcher: options.dispatcher as Dispatcher | undefined });
+        this.socket = socket;
+        this.key = key;
+        await new Promise<void>((resolve, reject) => {
+            const clean = (): void => {
+                socket.removeEventListener("open", opened);
+                socket.removeEventListener("error", failed);
+                socket.removeEventListener("close", failed);
+                options.signal?.removeEventListener("abort", aborted);
+            };
+            const opened = (): void => { clean(); resolve(); };
+            const failed = (): void => { clean(); reject(new Error("Responses WebSocket handshake failed")); };
+            const aborted = (): void => { clean(); this.close(); reject(new DOMException("Aborted", "AbortError")); };
+            socket.addEventListener("open", opened, { once: true });
+            socket.addEventListener("error", failed, { once: true });
+            socket.addEventListener("close", failed, { once: true });
+            if (options.signal?.aborted) aborted();
+            else options.signal?.addEventListener("abort", aborted, { once: true });
+        });
+        return socket;
+    }
+
+    async fetch(url: string, options: FetchOptions, rotateRetry = true): Promise<Response> {
+        if (options.method !== "POST" || !new URL(url).pathname.endsWith("/responses") || typeof options.body !== "string") throw new Error("Unsupported request in Responses WebSocket transport");
+        const parsed: unknown = JSON.parse(options.body);
+        if (!object(parsed) || !Array.isArray(parsed.input)) throw new Error("Invalid Responses WebSocket request");
+        const { stream, stream_options: _streamOptions, background: _background, previous_response_id: _previous, type: _type, ...body } = parsed;
+        const socket = await this.connect(url, options);
+        if (this.active) throw new Error("Responses WebSocket exchange already active");
+        const request = this.history.continuation(body);
+        return new Promise<Response>((resolve, reject) => {
+            let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+            let settled = false;
+            let ended = false;
+            let retryFull = request.previous_response_id !== undefined;
+            const encoder = new TextEncoder();
+            const clean = (): void => {
+                ended = true;
+                socket.removeEventListener("message", message);
+                socket.removeEventListener("error", failed);
+                socket.removeEventListener("close", failed);
+                options.signal?.removeEventListener("abort", aborted);
+                this.active = undefined;
+            };
+            const fail = (error: Error): void => {
+                if (ended) return;
+                this.history.clear();
+                clean();
+                if (settled) controller?.error(error);
+                else reject(error);
+            };
+            const failed = (): void => fail(new Error("Responses WebSocket upstream disconnected before completion"));
+            const aborted = (): void => { fail(new DOMException("Aborted", "AbortError")); this.close(); };
+            const message = (event: { data: unknown }): void => {
+                if (ended) return;
+                try {
+                    if (typeof event.data !== "string" || Buffer.byteLength(event.data) > MAX_REQUEST_BYTES) throw new Error("Invalid or oversized Responses WebSocket frame");
+                    const frame: unknown = JSON.parse(event.data);
+                    if (!object(frame) || typeof frame.type !== "string") throw new Error("Invalid Responses WebSocket event");
+                    if (frame.type === "error" && !settled) {
+                        const error = object(frame.error) ? frame.error : {};
+                        if (rotateRetry && error.code === "websocket_connection_limit_reached") {
+                            clean();
+                            this.close();
+                            resolve(this.fetch(url, options, false));
+                            return;
+                        }
+                        if (retryFull && (error.code === "previous_response_not_found" || frame.status === 400 && (error.code === undefined || error.code === "invalid_request_error"))) {
+                            retryFull = false;
+                            this.history.clear();
+                            socket.send(JSON.stringify({ ...body, type: "response.create" }));
+                            return;
+                        }
+                        clean();
+                        this.history.clear();
+                        const status = typeof frame.status === "number" && frame.status >= 400 && frame.status <= 599 ? frame.status : 400;
+                        resolve(new Response(JSON.stringify(frame), { status, headers: { "content-type": "application/json" } }));
+                        return;
+                    }
+                    if (stream !== true) {
+                        if (frame.type === "response.completed" || frame.type === "response.failed" || frame.type === "response.incomplete") {
+                            clean();
+                            this.history.commit(body, frame.response);
+                            resolve(new Response(JSON.stringify(frame.response), { headers: { "content-type": "application/json" } }));
+                        } else if (frame.type === "error") fail(new Error("Responses WebSocket upstream error"));
+                        return;
+                    }
+                    if (!settled) {
+                        settled = true;
+                        const readable = new ReadableStream<Uint8Array>({
+                            start: c => { controller = c; },
+                            cancel: () => { fail(new DOMException("Aborted", "AbortError")); this.close(); },
+                        }, { highWaterMark: MAX_REQUEST_BYTES, size: chunk => chunk.byteLength });
+                        resolve(new Response(readable, { headers: { "content-type": "text/event-stream" } }));
+                    }
+                    if ((controller?.desiredSize ?? 0) < 0) throw new Error("Responses WebSocket upstream buffer limit exceeded");
+                    controller?.enqueue(encoder.encode(`event: ${frame.type}\ndata: ${event.data}\n\n`));
+                    if (frame.type === "response.completed" || frame.type === "response.failed" || frame.type === "response.incomplete" || frame.type === "error") {
+                        clean();
+                        this.history.clear();
+                        this.history.commit(body, frame.response);
+                        controller?.close();
+                    }
+                } catch (error) {
+                    fail(error instanceof Error ? error : new Error("Invalid Responses WebSocket event"));
+                    this.close();
+                }
+            };
+            this.active = { fail };
+            socket.addEventListener("message", message);
+            socket.addEventListener("error", failed);
+            socket.addEventListener("close", failed);
+            options.signal?.addEventListener("abort", aborted, { once: true });
+            if (options.signal?.aborted) aborted();
+            else {
+                try { socket.send(JSON.stringify({ ...request, type: "response.create" })); }
+                catch (error) { fail(error instanceof Error ? error : new Error("Responses WebSocket send failed")); }
+            }
+        });
+    }
+}
+
+function errorFrame(code: string, message: string, status = 400): string {
+    return JSON.stringify({ type: "error", status, error: { type: "invalid_request_error", code, message } });
+}
+
+class ResponsesWsResponse extends http.ServerResponse {
+    private ended = false;
+    private sent = false;
+    private buffer = "";
+    private readonly decoder = new TextDecoder();
+    response?: JsonObject;
+    terminal = false;
+
+    constructor(req: http.IncomingMessage, private readonly peer: WebSocket) {
+        super(req);
+        Object.defineProperty(this, "headersSent", { get: () => this.sent });
+        Object.defineProperty(this, "writableEnded", { get: () => this.ended });
+        Object.defineProperty(this, "socket", { get: () => req.socket });
+    }
+
+    override write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
+    override write(chunk: string | Uint8Array, encoding: BufferEncoding, callback?: (error?: Error | null) => void): boolean;
+    override write(chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean {
+        this.sent = true;
+        const cb = typeof encoding === "function" ? encoding : callback;
+        this.buffer += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
+        if (this.buffer.length > MAX_REQUEST_BYTES) throw new Error("Responses WebSocket output buffer limit exceeded");
+        this.buffer = normalizeSseLineEndings(this.buffer);
+        let index: number;
+        while ((index = this.buffer.indexOf("\n\n")) >= 0) {
+            const block = this.buffer.slice(0, index);
+            this.buffer = this.buffer.slice(index + 2);
+            const data = block.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+            if (!data || data === "[DONE]") continue;
+            const frame: unknown = JSON.parse(data);
+            if (object(frame)) {
+                if (frame.type === "response.completed" && object(frame.response)) this.response = frame.response;
+                if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(frame.type))) this.terminal = true;
+            }
+            if (this.peer.readyState === WebSocket.OPEN) this.peer.send(data, { binary: false });
+        }
+        cb?.();
+        if (this.peer.bufferedAmount > MAX_REQUEST_BYTES) {
+            this.peer.close(1013, "Output buffer limit exceeded");
+            this.destroy();
+        }
+        return true;
+    }
+
+    override end(callback?: () => void): this;
+    override end(chunk: unknown, callback?: () => void): this;
+    override end(chunk: unknown, encoding: BufferEncoding, callback?: () => void): this;
+    override end(chunk?: unknown, encoding?: BufferEncoding | (() => void), callback?: () => void): this {
+        if (this.ended) return this;
+        if (typeof chunk === "string" || chunk instanceof Uint8Array) this.write(chunk);
+        if (!this.terminal && this.peer.readyState === WebSocket.OPEN) {
+            let details: unknown;
+            try { details = JSON.parse(this.buffer); } catch { details = undefined; }
+            this.peer.send(object(details)
+                ? JSON.stringify({ ...details, type: "error", status: this.statusCode >= 400 ? this.statusCode : 502 })
+                : errorFrame("incomplete_response", "Responses exchange ended without a terminal event", 502));
+        }
+        this.ended = true;
+        this.emit("finish");
+        this.emit("close");
+        const cb = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : callback;
+        if (typeof cb === "function") cb();
+        return this;
+    }
+}
+
+export function installResponsesWebSocket(
+    server: http.Server,
+    dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
+    log: (level: string, message: string) => void,
+): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
+    const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
+    const transports = new Set<ResponsesWsUpstream>();
+    const close = server.close.bind(server);
+    server.close = callback => {
+        for (const transport of transports) transport.close();
+        for (const peer of wss.clients) peer.terminate();
+        return close(callback);
+    };
+    server.on("close", () => {
+        for (const transport of transports) transport.close();
+        for (const peer of wss.clients) peer.terminate();
+        wss.close();
+    });
+    return (source, socket, head) => {
+        const match = /^\/bili\/responses\/(https?:\/\/.*\/responses(?:\?.*)?)$/.exec(source.url ?? "");
+        const conversation = source.headers["x-bili-plugin-conversation"];
+        if (!match || !isLoopbackAddress(source.socket.remoteAddress) || source.headers["x-bili-plugin"] !== "opencode" || typeof conversation !== "string" || conversation.trim().length === 0) return false;
+        const upstream = match[1];
+        void (async () => {
+            const verdict = await checkTunnelDestination(upstream, { selfPort: source.socket.localPort, clientLoopback: true, allowlist: tunnelAllowlistFromEnv() });
+            if (!verdict.ok) {
+                socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                return;
+            }
+            if (socket.destroyed) return;
+            wss.handleUpgrade(source, socket, head, peer => {
+                const transport = new ResponsesWsUpstream();
+                transports.add(transport);
+                const history = new ResponsesWsHistory();
+                let active: ResponsesWsResponse | undefined;
+                let busy = false;
+                peer.on("error", () => {});
+                peer.on("close", () => {
+                    active?.destroy();
+                    transport.close();
+                    history.clear();
+                    transports.delete(transport);
+                });
+                peer.on("message", (data, binary) => {
+                    if (binary) { peer.close(1003, "Responses requires text frames"); return; }
+                    if (busy) { peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
+                    let frame: unknown;
+                    let body: JsonObject;
+                    try {
+                        frame = JSON.parse(data.toString());
+                        if (!object(frame) || frame.type !== "response.create") throw new Error("Unsupported Responses client event");
+                        if (frame.stream_id !== undefined || frame.stream !== undefined || frame.background !== undefined || frame.stream_options !== undefined) throw new Error("Unsupported Responses transport options");
+                        body = { ...history.expand(frame), stream: true };
+                        if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) throw new Error("request_too_large");
+                    } catch (error) {
+                        const code = error instanceof Error && ["previous_response_not_found", "request_too_large"].includes(error.message) ? error.message : "invalid_request";
+                        peer.send(errorFrame(code, code === "previous_response_not_found" ? "Send full input without previous_response_id" : "Invalid or oversized response.create event", code === "request_too_large" ? 413 : 400));
+                        return;
+                    }
+                    busy = true;
+                    const req = new http.IncomingMessage(source.socket);
+                    req.complete = true;
+                    req.method = "POST";
+                    req.url = source.url;
+                    const connectionHeaders = connectionNamedHeaders(source.headers.connection);
+                    for (const [key, value] of Object.entries(source.headers)) {
+                        if (!UPSTREAM_HOP_HEADERS.has(key) && !connectionHeaders.has(key) && !key.startsWith("sec-websocket-") && key !== "content-encoding") req.headers[key] = value;
+                    }
+                    req.headers["content-type"] = "application/json";
+                    req.push(Buffer.from(JSON.stringify(body)));
+                    req.push(null);
+                    const res = new ResponsesWsResponse(req, peer);
+                    res.on("error", () => {});
+                    active = res;
+                    void withFetchTransport((url, options) => transport.fetch(url, options), async () => {
+                        try {
+                            await dispatch(req, res);
+                            if (res.response) history.commit(body, res.response);
+                        } catch {
+                            log("warn", "[responses-ws] exchange failed");
+                            if (!res.writableEnded) res.end();
+                        } finally {
+                            active = undefined;
+                            busy = false;
+                        }
+                    });
+                });
+                log("info", "[responses-ws] OpenCode Responses socket connected (ACP request pipeline)");
+            });
+        })().catch(() => {
+            log("warn", "[responses-ws] upgrade failed");
+            if (!socket.destroyed) socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        });
+        return true;
+    };
+}

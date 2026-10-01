@@ -225,7 +225,7 @@ test("setup(route): header stamping applies to the REPLACED request, tools regis
     };
     const setup = createOpencodeV2Setup({ route: createNativeRoute(state, { probe: async () => true }) });
     const cleanup = await setup(ctx);
-    assert.deepEqual(hooks.map((h) => h.name), ["http.request"]);
+    assert.deepEqual(hooks.map((h) => h.name), ["http.request", "experimental.ws.handshake"]);
     assert.deepEqual(tools.sort(), [...EXPECTED_TOOLS].sort());
     const e: V2HttpRequestEvent = {
         sessionID: "ses_abc",

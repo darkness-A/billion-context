@@ -231,7 +231,7 @@ function isBiliControlUrl(url: string): boolean {
  *  done) but DOES stamp plugin headers on them. */
 export function routedBiliModelUrl(url: string): string | undefined {
     if (!/^https?:\/\//i.test(url) || url.includes("/__bili/") || url.includes("/__acp/")) return undefined;
-    const m = /^https?:\/\/[^/]+\/bili\/(https?:\/.+)$/i.exec(url);
+    const m = /^https?:\/\/[^/]+\/bili\/(?:responses\/)?(https?:\/.+)$/i.exec(url);
     if (m === null) return undefined;
     return isModelApiUrl(m[1]) ? m[1] : undefined;
 }

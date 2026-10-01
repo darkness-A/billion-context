@@ -1,4 +1,5 @@
 import { Agent } from "undici";
+import { currentFetchTransport } from "./fetch-transport.js";
 import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
 
 /** HTTP robustness helpers for the proxy.
@@ -186,7 +187,10 @@ export async function fetchWithTimeout(
         // which structurally conflicts with the `undici` package's exported
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
-        const raw = await fetch(url, finalOpts as RequestInit) as Response;
+        const transport = currentFetchTransport();
+        const raw = transport
+            ? await transport(url, finalOpts)
+            : await fetch(url, finalOpts as RequestInit) as Response;
         if (raw.body) {
             // Wrap the body so each chunk re-arms the timer (idle timeout); carry
             // status/headers onto a fresh Response so callers see an identical shape.
